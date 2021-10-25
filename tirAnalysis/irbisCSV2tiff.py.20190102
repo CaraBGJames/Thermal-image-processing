@@ -1,0 +1,172 @@
+#!/usr/bin/python3
+
+""" irbisCSV2tiff.py
+Provides a module for reading a csv file produced by IRBIS 3 (IR camera 
+software) and outputting tiff images.  There is an option to produce either 
+standard 8-bit images or 16-bit "bigTiffs".
+
+This file was originally called readCSVfiles.py
+
+To do:
+------
+- write exifdata to image file
+
+"""
+
+import numpy as np
+#import piexif
+
+
+def irbisCSV2data(fname, sep=','):
+    """
+    Returns the data and metadata (header info) contained within "fname"
+
+    Parameters:
+    -----------
+    fname : str
+        the name of the file to open
+    sep : str, optional
+        the separator of the input file.  Default is "comma"
+
+    Returns:
+    --------
+    data : np.array
+        the data 
+    metadata : dict
+        the header information
+    """
+    f = open(fname, 'r', encoding='utf-8', errors='ignore')
+
+    found = False
+    data  = []
+    nread = 0
+    metadata = {}
+    mdread = 0
+
+    ##--------------------READ METADATA--------------------##
+    key   = None
+    while key != '':
+        # Remove leading and trailing whitespace, as well as any newline
+        # characters.  Split the remaining output.
+        key, *params = map(str.strip, f.readline().split('='))
+        if len(params) > 0: 
+            params = params[0].split(';')
+        if mdread > 0 and key != '':
+            metadata[key] = params
+        mdread += 1
+
+    try:
+        for key in metadata.keys():
+            if key != 'TempUnit':
+                vals = metadata[key]
+                floatVals = []
+                if len(vals) > 1:
+                    for val in vals:
+                        floatVals.append(float(val))
+                else:
+                    floatVals = float(vals[0])
+                vals = floatVals
+            else:
+                vals = metadata[key][0]  # 'TempUnit'
+            metadata[key] = vals
+    except ValueError:
+        pass
+        
+    ##--------------------READ THE DATA--------------------## 
+    for line in f:
+        if found:
+            line = line.strip().split(sep)
+            # Sometimes an additional, empty element is found at the 
+            # end of the line.  Cut it off.
+            if line[-1] == '':
+                line = line[:-1]
+            data.append(line)
+            nread += 1  # should equal 480 if the code completes successfully
+        else:
+            if line.strip() == '[Data]': found = True
+
+    f.close()
+
+    data = np.float64(data)
+
+    return data, metadata
+
+
+def irbisData2Tiff(savename, data, limits=(None, None),
+                   metadata=None, bigtiff=False, 
+                   focal_length=30, verbose=False):
+    ''' Takes a data array and saves it as a tiff image. 
+    
+    Parameters:
+    -----------
+    savename : str
+        the root of the filename under which the file should be saved.  Note 
+        that the postfix '.tif' (or '_bt.tif' if bigtiff is True) will be added
+        to this.
+    data :  array_like
+        the data array to save
+
+    Optional:
+    ---------
+    limits : tuple or list
+        lower and upper bounds of the data range to be entered as a 
+        tuple (or list).  Defaults to (None, None)
+    metadata : dict
+        exif data to be written to a metadata header
+    bigtiff : boolean
+        option to save as a 16-bit tiff
+    
+    TO DO:
+        - EXIF write function
+        - 
+    '''
+
+    from matplotlib.cm import gray
+
+    # Clip the data to the range of "limits", if given
+    TLimits = [data.min(), data.max()]
+    if any(limits) is not None:  # This if statement probably unnecessary
+        if limits[0] is not None:
+            TLimits[0] = limits[0]
+        if limits[1] is not None:
+            TLimits[1] = limits[1]
+        TRange = TLimits[1] - TLimits[0]
+        data[data < TLimits[0]] = TLimits[0]
+        data[data > TLimits[1]] = TLimits[1]
+    TRange = np.diff(TLimits)
+        
+    # Options according to the required image bit depth
+    if bigtiff:
+        from tifffile import imsave
+        savename += '_bt.tif'
+        bitDepth = 2**16 - 1    # N.B. range is 0--65536
+        imsave(savename, data)
+    else:
+        # imsave is depreciated in SciPy v1.0.0 and will be replaced in v1.2.0 
+        # by imageio.imwrite (or use {plt,tifffile}.imsave?)
+        from matplotlib.pyplot import imsave
+        # from imageio import imwrite as imsave
+        savename += '.tif'
+        bitDepth = 2**8 - 1     # N.B. range is 0--255
+        # Create rescaled image
+        rescaledData = np.round((data - TLimits[0]) / TRange * bitDepth)
+        print(rescaledData.min(), rescaledData.max())
+        # Save the image to file whilst keeping the grey levels constant
+        imsave(savename, rescaledData, cmap=gray, vmin=0, vmax=bitDepth)
+
+        
+    if metadata:
+        # Create exif data from metadata
+        zeroth_ifd = {}
+        # exif_ifd = {piexif.ExifIFD.FNumber :         1.,
+        #             piexif.ExifIFD.FocalLength :     u'%d mm' % focal_length,
+        #             piexif.ExifIFD.LensMake :        u'Janoptik',
+        #             piexif.ExifIFD.SubjectDistance : u'4.59 m',
+        # }
+
+    if verbose:
+        print('Saving file %s...  Data limits: [%3.1f, %3.1f]' %
+              (savename, TLimits[0], TLimits[1]))
+
+
+    

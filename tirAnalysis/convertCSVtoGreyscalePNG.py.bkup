@@ -1,0 +1,36 @@
+"""
+convertCSVtoGreyscalePNG.py
+
+Reads a floating-point csv file and returns an integer-valued, greyscale png.
+For use with thermal images, the maximum and minimum values (23 and 80 degC by
+default) need to be given.
+"""
+
+from numpy import genfromtxt
+
+import numpy as np
+import sys
+import Image
+
+fidi = sys.argv[1]  # input file name
+
+# Read the file to a numpy array 
+data = genfromtxt(fidi, delimiter=';')
+
+print "For file %s, data range is %5.1f, %5.1f" % (fidi, data.min(), data.max())
+
+# rescale data 
+range = np.array([23.0, 80.0])  # Image tempeatures should be within this range
+rescaled = (data - range.min())/range.max() * 255.0
+
+# Check for out-of-bounds values and clip to 0-255
+for i, col in enumerate(rescaled):
+    for j, el in enumerate(col):
+        if el < 0:
+            recaled[i][j] = 0.0
+        if el > 255:
+            recaled[i][j] = 255.0
+
+fido = fidi[11:-4] + '.png'  # assumes fidi of form ./csvFiles/Ir_xxxx.csv
+im = Image.fromarray(rescaled)
+im.save(fido)

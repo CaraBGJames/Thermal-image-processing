@@ -1,0 +1,461 @@
+#!/usr/bin/python
+
+"""
+tirAnalysis.py : this code defines functions and returns values for the 
+heat flux calculated from TIR images using image mosaics.  Uses afine 
+transform parameters from QGIS georeferencing.  
+
+Several layers are imported:
+Tlayer   : thermal image mosaic - a greyscale image georeferenced to the DEM
+DEMlayer : DEM
+
+CHANGE LOG:
+2018-07-13      Converting functions to be python3 compatible.  This involves
+                removing all the qgis dependencies, which only support 
+                python2.7
+2018-07-14      Wrote a plotting function for the flux maps so that the same
+                code can be applied to the radiative, convective and total 
+                surface flux cases.
+                Note that there is a discrepancy between calculations of 
+                radiative flux involving this new function
+
+TO DO:
+- Set cbar upper lim to be equal to the last cbar label
+- Is pixelAreaInMeters actually in meters?
+- Account for atmospheric transmissivity
+- Account for ground emissivity (partially done) - make emissivity map
+- Formally calculate the heat transfer coefficient from base data.
+- Calculate Sekioka + Yuhara geothermal flux
+"""
+
+#from qgis.utils import iface.activeLayer
+#from qgis.core import QgsRasterLayer, QgsMapLayerRegistry
+#from PyQt4.QtCore import QFileInfo # Not being used.
+try:
+    from osgeo import gdal #, osr
+except ImportError:
+    import gdal #, osr
+from skimage.io import imread
+#from scipy.misc import imsave
+from colormap.colormaps import cmaps  # new matplotlib colormaps
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import pandas
+import utm
+
+
+def openRaster(fileName):
+    """
+    Opens a raster layer from a file name using gdal utilities.  This 
+    function is not currently being used, and will be removed in the future.
+    """
+    try:
+        # fileInfo = QFileInfo(fileName)
+        # path     = fileInfo.filePath()
+        # baseName = fileInfo.baseName()
+        #layer    = QgsRasterLayer(path, baseName)
+        layerDS  = gdal.Open(filename)
+        layer    = layerDS.GetRasterBand(1).ReadAsArray()
+    except:
+        print("Failed to open layer")
+    # QgsMapLayerRegistry.instance().addMapLayer(layer)
+
+    # if layer.isValid():
+    #     print("Successful")
+    #     return layer
+    # else:
+    #     print("Unsuccessful")
+    #     return
+    return layer
+
+
+def pixel2coord(col, row, transform):
+    """Returns global coordinates to pixel center using base-0 raster index"""
+    c, a, b, f, d, e = transform
+    xp = a * (col + .5) + b * (row + .5) + c
+    yp = d * (col + .5) + e * (row + .5) + f
+    return np.array((xp, yp))
+
+
+# def val_raster(point, raster):
+#     """
+#     Returns the values of a raster layer at a location point.  Depends upon
+#     gdal and thus will be removed
+#     """
+#     ident = raster.dataProvider().identify(point, 
+#                                            QgsRaster.IdentifyFormatValue)
+#     return ident.results().values()
+
+
+def atmosphericTransmissivity(dist, atmConds=None, CO2=400, CH4=1.7):
+    """
+    Returns the transmissivity of an atmosphere over a given distance.
+
+    Further to this, some assumptions for the concentration of certain
+    gas species and scattering due to aerosols must be made.  These are 
+    summarised as:
+    SPECIES     CONC.   UNITS
+    CO2         400     ppm
+    CH4         1.7     ppm
+    aerosols    
+
+    N.B. The current version ignores all these details and instead returns
+    a fit to the data of Fig. 7.7, Harris (2013), pp. 430
+
+    Parameters:
+    -----------
+    dist : float
+        The distance in metres over which the optical depth should be calculated
+    atmConds : pandas.DataFrame
+        Atmospheric conditions: 
+                TEMP/[deg C]
+            PRESSURE/[mbar]
+            HUMIDITY/[%]
+    CO2 : float
+        Atmospheric concentration of CO2
+    CH4 : float
+        Atmospheric concentration of CH4
+
+    Returns:
+    --------
+    Transmissivity : float
+    """
+    transPer500m = .88    # From Harris (2013)
+    transPer001m = np.power(transPer500m, 1/500)
+
+    return .9289976938 * np.exp(-1.235159e-4 * dist)
+
+#    return 1.   # transPer001m ** dist
+
+
+def unpackLatLonElev(latLonElevTuple):
+    """ 
+    Unpack lat, lon, elevation tuple.  
+    If no elevation data is available, set this to zero.
+
+    Parameters:
+    -----------
+    latLonElevTuple : tuple or array-like
+        Tuple containng latitude, longitude, elevation 
+
+    Returns:
+    --------
+    lat : float
+        latitude from latLonElevTuple
+    lon : float
+        longitude from latLonElevTuple        
+    elev : float
+        elevation from latLonElevTuple
+    """
+    if len(latLonElevTuple) == 3:
+        lat, lon, elev = latLonElevTuple
+    elif len(latLonElevTuple) == 2:
+        lat, lon = latLonElevTuple
+        elev     = 0.
+    return lat, lon, elev
+
+
+def latLonElevToUTM(latLonElevTuple):
+    """
+    Converts a lat-lon-elev tuple to easting-northing-elev tuple
+
+    Requires the UTM package.
+    """
+    try:
+        import utm
+    except ModuleNotFoundError as e:
+        print(e.message)
+
+    lat, lon, elev = unpackLatLonElev(latLonElevTuple)
+    easting, northing, *foobar = utm.from_latlon(lat, lon)
+    return (easting, northing, elev)
+
+
+def distanceToTarget(latLongElevObserver, latLongElevTarget):
+    """
+    Returns the approximate distance from the observer to the target (in 
+    meters) based on a pair of latitude-longitude-elevation tuples.
+
+    Parameters:
+    -----------
+    latLonElevObserver : tuple or array-like
+        A list, array or tuple containing the latitude, longitude and 
+        elevation of the observer station.
+    latLonElevTarget : tuple or array-like
+        A list, array or tuple containing the latitude, longitude and 
+        elevation of the target object.
+
+    Returns:
+    --------
+    dist : float
+        Distance from observer to target.
+    """
+    R = 6371e3  # Mean radius of earth in meters (from Wikipedia)
+    # Observer
+    obsEasting, obsNorthing, obsElev = latLonElevToUTM(latLongElevObserver)
+    obsVec = np.array([obsEasting, obsNorthing, obsElev])
+    print("Observer UTM: %.2f E, %.2f N, %d m a.s.l." % tuple(obsVec))
+
+    # Target
+    tarEasting, tarNorthing, tarElev = latLonElevToUTM(latLongElevObserver)
+    tarVec = np.array([tarEasting, tarNorthing, tarElev])
+    print("Target   UTM: %.2f E, %.2f N, %d m a.s.l." % tuple(tarVec))
+
+    # Calculate distance using vector L2 norm (shorter than sqrt method)
+    dist = np.linalg.norm(obsVec - tarVec)
+    return dist #, obsVec, tarVec
+
+
+def UTM2tick(eastings, northings, transform):
+    """ A utility for converting UTM loactions to tick marks using the 
+        GDAL-defined afine transform """
+    return ((eastings - transform[0])/transform[1],
+            (northings - transform[3])/transform[5])
+
+
+def tick2UTM(xticks, yticks, transform):
+    """ A utility for converting tick marks to UTM loactions using the 
+        GDAL-defined afine transform """
+    return (transform[0] + xticks * transform[1], 
+            transform[3] + yticks * transform[5])
+
+
+if __name__ == "__main__":
+    # Import layers
+    # Thermal layer
+    SITE       = '01'
+    workingDir = ('/home/david/FieldWork/Vulcano/2016-09-Vulcano/' + 
+                  '2016-09-17_nighttimeFLIR/')
+    fileName    = (workingDir + './SITE' + SITE +
+                   '/georeferenced/SITE' + SITE + '_georef.tif')
+    TlayerDS    = gdal.Open(fileName) 
+    # Temp data is layer 1, transparency is layer 2
+    try:
+        Tlayer = TlayerDS.GetRasterBand(1).ReadAsArray()
+    except AttributeError:
+        pass
+
+    # DEM layer
+    DEMfileName = (workingDir +
+                   '../DEM/06_final_20cm_model_ortho/dem_20cm_hshd.bmp')
+    DEMlayerDS  = gdal.Open(DEMfileName)
+
+    # Unravel GDAL affine transform parameters
+    transform = TlayerDS.GetGeoTransform()
+
+    # Load log file for TIR measurements and drop invalid columns
+    names = [u'POS', u'GPS E', u'GPS N', u'TIME', u'TEMP', u'HUMIDITY',
+             u'PRESSURE', u'CLOUD', u'NOTES']
+    df = pandas.read_excel(workingDir + '2016-09-17_nighttimeFLIR-log.xls', 
+                           sheet_name='Sheet1', names=names,
+                           header=2, skiprows=2).drop(['NOTES'], axis=1)
+    # Cloud cover column has non-numeric values - convert these
+    df.loc[df.CLOUD == "< 5", 'CLOUD'] = 1  # suppose that 1 % < 5 % ...
+
+    # Get width and height of raster layer (np.array -> shape).  
+    H, W = Tlayer.shape
+
+    # Thermal image contains two layers, greyscale and alpha [0 255].  If alpha
+    # layer has value = 255, that corresponding pixel is transparent.  Create a 
+    # mask to exploit this and only extract temperature if mask[i,j] == 1
+    mask = TlayerDS.GetRasterBand(2).ReadAsArray() == 255
+    
+    # Ordinarily we would use the vectors joining nodes on two of the sizes of 
+    # a pixel and take the cross product to define the area of the pixel.
+    # However, all pixels are the same size so we can get away with being lazy 
+    # here simplifying.  Is this truly in meters???
+    northingPixelSize = transform[1]
+    eastingPixelSize  = -transform[5]
+    pixelAreaInMeters = northingPixelSize * eastingPixelSize
+    # How many pixels actually correspond to thermally-active zones
+    areaCount = np.count_nonzero(mask)
+
+    # Define Stefan-Boltzmann constant and emissivities (8-14 micron band)
+    stefanBoltzmann = 5.67e-8   # W m**-2 K**-4
+    epsSurface = 0.975          # See table 2.3 of Harris (2013, pp. 81)
+    tauAtmosph = atmosphericTransmissivity(500)  # Fill in function
+    epsAtmosph = 1.0 - tauAtmosph
+    # Heat transfer coefficient.  This needs to be formally calculated
+    hc = .4
+
+    # Define temperature range 
+    Trange = np.array([23., 80.]) + 273.14  # Kelvin
+
+    # Convert pixel values to real (absolute) temperatures
+    TempField  = Tlayer / 255.0              # Normalise values 
+    TempField *= Trange.max() - Trange.min() # Scale by temperature range
+    TempField += Trange.min()                # Add offset
+
+    # Ambient temperature for measurements taken at SITE05
+    Tamb  = df[df.POS == 5].TEMP.values[0] + 273.14  # Kelvin
+    Tamb4 = Tamb ** 4  # To avoid excessive operations
+    epsTambPow4  = epsAtmosph * Tamb4    
+
+    # Pull all the row and col calculations out of the loop to save time
+    Tstar = np.copy(TempField)
+    T     = np.power((Tstar**4 - epsAtmosph * Tamb4) 
+                     / (epsSurface * tauAtmosph), .25)
+
+    Qrad  = (epsSurface * stefanBoltzmann* (T**4 - Tamb4))
+    Qconv = hc * (T - Tamb)
+    Qsurf = Qrad + Qconv
+
+    # Calculate total fluxes and convert to MW for easier typing later
+    QradTot  = np.nansum(Qrad)  * 1e-6 * pixelAreaInMeters 
+    QconvTot = np.nansum(Qconv) * 1e-6 * pixelAreaInMeters 
+    QsurfTot = np.nansum(Qsurf) * 1e-6 * pixelAreaInMeters 
+
+    # Total radiative flux, not accounting for atmospheric and ground 
+    # emissivities
+    print('')  # Clear line
+    print('Total radiative  flux : %.2f MW' % (QradTot))
+    print('Total convective flux : %.2f MW' % (QconvTot))
+    print('Total surface flux    : %.2f MW' % (QsurfTot))
+    print('#-----Sanity check: %.2f = %.2f + %.2f = %.2f-----#\n' % (
+            QsurfTot, 
+            QradTot, 
+            QconvTot, 
+            QradTot + QconvTot))
+
+    ## PLOT AND SAVE FLUX MAPS
+
+    # Maxima and minima for the plots in UTM
+    yMax, xMin, foo, bar = utm.from_latlon(transform[0]/1e5, transform[4]/1e5)
+    yMin, xMax, foo, bar = utm.from_latlon((transform[0]+H*transform[1])/1e5,
+                                           (transform[3] + W*transform[5])/1e5)
+
+    # Define UTM eastings and northings that will be used on the plots
+    eastings  = 496000  + np.arange(500, 1000, 100)
+    northings = 4250000 + np.arange(600, 950, 50)
+    newXticks, newYticks = UTM2tick(eastings, northings, transform)
+
+    def plotFluxes(flux, fluxType, figAx, clim, eastingsNorthings):
+        """
+        A plotting utilty to ensure that the same treatment is applied to 
+        all of the fluxes
+
+        Parameters:
+        -----------
+        flux (np.array)
+            Geotransformed flux image
+        fluxStyle (str)
+            'Radiative', 'Convective' or 'Surface'
+        figAx (matplotlib fig and axes)
+        clim (tuple of ints/floats)
+            Upper and lower intensity limits for the image
+        eastingsNorthings (tuple of lists/np.arrays)
+            UTM eastings and northings for the image
+        """
+        labelFontSize = 8
+        fig, ax = figAx
+        eastings, northings = eastingsNorthings
+
+        im = ax.imshow(flux, cmap=cmaps.get('magma'), clim=clim)
+        # colourbar properties
+        cbar = fig.colorbar(im, shrink=.65)
+        cbar.set_label(label='%s heat flux/[W/m$^2$]' % fluxType.capitalize(), 
+                       rotation = 270, labelpad=15)
+        labels = cbar.ax.get_yticklabels()
+        for label in labels:
+            label.set_fontsize(labelFontSize)
+        # Set last cbar label to be '> 150' (for example)
+        labels[-1].set_text('> ' + labels[-1].get_text())
+        cbar.ax.set_yticklabels(labels)
+        # Convert axes to UTM positions
+        xticks = plt.xticks()[0]
+        yticks = plt.yticks()[0]
+        plt.xticks(newXticks, eastings)
+        plt.yticks(newYticks, northings)
+        for tick in ax.xaxis.get_major_ticks():
+            tick.label.set_fontsize(labelFontSize)
+        for tick in ax.yaxis.get_major_ticks():
+            tick.label.set_fontsize(labelFontSize)
+        # tick.label.set_rotation('vertical')
+
+        # labels + title
+        # plt.xlabel('E-W distance/[pixels]')
+        # plt.ylabel('N-S distance/[pixels]')
+        plt.xlabel('UTM Easting/[metres]')
+        plt.ylabel('UTM Northing/[metres]')
+
+        # Calculate total fluxes and convert to MW for easier typing later
+        QTot = np.nansum(flux)  * 1e-6 * pixelAreaInMeters 
+
+        plt.title('Total %s flux: %.2f MW' % (fluxType.lower(), QTot))
+
+        plt.draw()
+        fig.tight_layout()
+        if fluxType.lower() == 'radiative':
+            keepChars = 3
+        else:
+            keepChars = 4
+        outname = 'Q%s' % fluxType.lower()[:keepChars]
+        plt.savefig(workingDir + outname + '.pdf', bbox_inches='tight')
+        plt.savefig(workingDir + outname + '.png', bbox_inches='tight')
+        plt.close()
+        return QTot
+
+    
+    # RADIATIVE FLUXES
+    QradOrig = Qrad.copy()
+    Qrad[T <= Trange[0]] = None  # So that the "empty" pixels are "transparent"
+    fig, ax = plt.subplots(figsize=(8,6), dpi=300)
+    QradTot = plotFluxes(Qrad, 'Radiative', (fig, ax),
+                         (0., 140.), (eastings, northings))
+    
+    # CONVECTIVE FLUXES
+    QconvOrig = Qconv.copy()
+    Qconv[T <= Trange[0]] = None #
+    fig, ax = plt.subplots(figsize=(8,6), dpi=300)
+    QconvTot = plotFluxes(Qconv, 'Convective', (fig, ax),
+                          (0., 10.), (eastings, northings))
+
+    # TOTAL SURFACE FLUXES (= QradTot + QconvTot)
+    QsurfOrig = Qsurf.copy()
+    Qsurf[T <= Trange[0]] = None #
+    fig, ax = plt.subplots(figsize=(8,6), dpi=300)
+    QsurfTot = plotFluxes(Qsurf, 'Surface', (fig, ax),
+                          (0., 140.), (eastings, northings))
+
+    # SAVE A COPY OF THE BASIC IMAGE
+    fileName = workingDir + './SITE' + SITE + '/stitched/SITE' + SITE + '.tif'
+    im = imread(fileName, as_grey=True, flatten=False)
+    # Convert to grey scale as per MATLAB
+    imGrey = np.dot(im[...,:3], [.2989, .5870, .1140])
+    # Normalise to [0, 1]
+    imGrey /= 255.0
+    # Rescale to temperature range
+    imRescaled = imGrey * (Trange.max() - Trange.min()) + Trange.min()
+    # Set transparent pixels in original image to be beyond the T range
+    imRescaled[im[...,3] == 0.0] = 0.0  # Absolute zero!
+    
+    # Plot the image and save
+    plt.figure(figsize=(8,6), dpi=300)
+    plt.imshow(imRescaled, cmap=cmaps.get('inferno'), 
+               clim=[Trange.min(), 325]) #Trange.max()])
+
+    # Set up colorbar properties
+    # cbar tick marks
+    tickPosns = np.arange(300, 330, 5) 
+
+    # Define colorbar
+    cbar = plt.colorbar(shrink=.4, ticks=tickPosns)
+
+    # Set cbar label properties
+    cbar.set_label('Apparent temp./[K]', rotation=270, labelpad=15)
+
+    # Set cbar tick labels
+    tickPosnLabels = list(map(str, tickPosns))
+    tickPosnLabels[0] = '< ' + tickPosnLabels[0]
+    tickPosnLabels[-1] = '> ' + tickPosnLabels[-1]
+    cbar.ax.set_yticklabels(tickPosnLabels)
+
+    #plt.show()
+    fig.tight_layout()
+    plt.savefig(workingDir + './SITE' + SITE + '/stitched/SITE'
+                + SITE + '-cbar.pdf', 
+                bbox_inches='tight')
+    plt.close()
+

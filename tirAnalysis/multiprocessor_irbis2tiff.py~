@@ -1,0 +1,38 @@
+#!/usr/bin/python3
+
+
+import multiprocessing
+import os  
+
+from glob import glob
+from tirAnalysis.irbisCSV2tiff import (irbisCSV2data,
+                                       irbisData2Tiff)
+
+
+def process_file(root, filename):  
+           
+    path = '../tiffs/' + root + '/'  
+    if not os.path.isdir(path):  
+        os.mkdir(path)  
+
+    data, md = irbisCSV2data(filename, sep=',')  
+    nu_fname = path + filename[:-4]  
+    print(filename + '\t', end='')  
+    irbisData2Tiff(nu_fname, data, cmap='RdGy_r')
+
+    return
+
+
+def multiprocessor_irbis2tiff(ROOT):
+    p = multiprocessing.Pool() 
+    for filename in sorted(glob(ROOT + '_*csv')):  
+        p.apply_async(process_file, [ROOT, filename])  
+    p.close()      
+    p.join()
+
+    return
+
+
+if __name__ == '__main__':
+    ROOT = 'AB112214'
+    multiprocessor_irbis2tif(ROOT)

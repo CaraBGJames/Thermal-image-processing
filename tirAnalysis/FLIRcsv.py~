@@ -1,0 +1,43 @@
+import numpy as np
+
+
+def readFLIRE4csv(filename, sep=';'):
+    '''
+    Returns an (numpy) array containing the radiometric data from FLIR E4 csv 
+    files.
+
+    Parameters:
+    -----------
+    filename (str)
+        Absolute or relative path of the file to read
+    sep (str)
+        Field separator.  Default is semicolon ';'
+
+
+    Returns:
+    --------
+    data (np.array)
+        Floating point (radiometric) image
+
+    '''
+    readData = False
+
+    data  = []
+    count = 0
+
+    with open(filename, 'r') as f:
+        for line in f:
+            # while readData is False
+            if line[:7] == 'Image 1':
+                line = line.strip().split(sep)[1:]
+                data.append(line)
+            if line[0] == sep:
+                data.append(line.strip().split(';')[1:])
+            if line[0] == sep and line[-2] == sep:
+                print(line)
+                data.append(line.strip().split(';')[1:-1])
+            count += 1
+
+    #data = np.float64(data)
+    print("%d lines read" % count)
+    return data

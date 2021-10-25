@@ -1,0 +1,316 @@
+#!/usr/bin/python
+
+"""
+tirAnalysis.py : this code defines functions and returns values for the 
+heat flux calculated from TIR images using image mosaics.  Uses afine 
+transform parameters from QGIS georeferencing.  
+
+Several layers are imported:
+Tlayer   : thermal image mosaic - a greyscale image georeferenced to the DEM
+DEMlayer : DEM
+
+TO DO:
+- Is pixelAreaInMeters actually in meters?
+- Account for atmospheric transmissivity and ground emissivity (partially 
+  done - check values for ground emissivity)
+- 
+"""
+
+#from qgis.utils import iface.activeLayer
+from qgis.core import QgsRasterLayer, QgsMapLayerRegistry
+from PyQt4.QtCore import QFileInfo
+from osgeo import gdal
+from skimage.io import imread
+from scipy.misc import imsave
+from colormap.colormaps import cmaps  # new matplotlib colormaps
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import pandas
+import utm
+
+
+def openRaster(fileName):
+    """
+    Opens a raster layer from a file name
+    """
+    try:
+        fileInfo = QFileInfo(fileName)
+        path     = fileInfo.filePath()
+        baseName = fileInfo.baseName()
+        layer    = QgsRasterLayer(path, baseName)
+    except:
+        print "Failed to open layer"
+    # QgsMapLayerRegistry.instance().addMapLayer(layer)
+    if layer.isValid():
+        print "Successful"
+    else:
+        print "Unsuccessful"
+    return layer
+
+
+def pixel2coord(col, row, transform):
+    """Returns global coordinates to pixel center using base-0 raster index"""
+    c, a, b, f, d, e = transform
+    xp = a * (col + .5) + b * (row + .5) + c
+    yp = d * (col + .5) + e * (row + .5) + f
+    return np.array((xp, yp))
+
+
+def val_raster(point, raster):
+    """
+    Returns the values of a raster layer at a location point.  
+    """
+    ident = raster.dataProvider().identify(point, 
+                                           QgsRaster.IdentifyFormatValue)
+    return ident.results().values()
+
+
+def atmosphericEmissivity(dataframe):
+    """
+    Returns the emissivity of an atmosphere for entries in dataframe 
+    with the following properties:
+    TEMP/[deg C]
+    PRESSURE/[mbar]
+    HUMIDITY/[%]
+    """
+    return 
+
+
+def distanceToTarget(latLongObserver, latLongTarget):
+    """
+    Returns the approximate distance from the observer to the target (in 
+    meters) based on a pair of latitude-longitude tuples.
+
+    Requires the UTM package
+    """
+    # R = 6371e3  # Mean radius of earth in meters (from Wikipedia)
+    # Observer
+    lat, lon = latLongObserver  # unpack observer tuple
+    obsEasting, obsNorthing, zoneNo, zoneLett = utm.from_latlon(lat, lon)
+    print "Observer UTM: %.2f E, %.2f N" % (obsEasting, obsNorthing)
+
+    # Target
+    lat, lon = latLongTarget    # unpack target tuple
+    tarEasting, tarNorthing, zoneNo, zoneLett = utm.from_latlon(lat, lon)
+    print "Target UTM:   %.2f E, %.2f N" % (tarEasting, tarNorthing)
+
+    # Calculate distance using vector L2 norm (shorter than sqrt method)
+    dist = np.linalg.norm(np.array([[obsEasting - tarEasting], 
+                                    [obsNorthing - tarNorthing]]))
+
+    return dist
+
+
+if __name__ == "__main__":
+    # Import layers
+    # Thermal layer
+    fileName = './SITE05/georeferenced/SITE05_georef.tif'
+    fileInfo = QFileInfo(fileName)
+    baseName = fileInfo.baseName()
+    TlayerDS = gdal.Open(fileName) 
+    Tlayer   = QgsRasterLayer(fileName, baseName)
+
+    # # DEM layer
+    # fileName = '../../DEM/06_final_20cm_model_ortho/dem_20cm.hshd.bmp'
+    # fileInfo = QFileInfo(fileName)
+    # baseName = fileInfo.baseName()
+    # DEMlayer = QgsRasterLayer(fileName, baseName)
+
+
+    # ident = DEMlayer.dataProvider().identify(QgsPoint(w, h), 
+    #                                          QgsRaster.IdentifyFormatValue)
+
+    # Unravel GDAL affine transform parameters
+    transform = TlayerDS.GetGeoTransform()
+
+    # Load log file for TIR measurements and drop invalid columns
+    df = pandas.read_excel('./2016-09-07_nighttimeFLIR-log.xls', 
+                           sheetname='Sheet1', 
+                           header=2, skiprows=2).drop(['NOTES'], axis=1)
+    # Cloud cover column has non-numeric values - convert these
+    df.CLOUD[df.CLOUD == "< 5"] = 1  # suppose that 1 % < 5 % ...
+
+    # Check if the thermal layer opened above is valid.  If not, open the 
+    # raster layer as an image
+    if Tlayer.isValid():
+        W = Tlayer.width()
+        H = Tlayer.height()
+        # print W, H, transform
+    else:
+        # print '\n##', '-'*20, 'Invalid layer', '-'*20, '##\n'
+        Tlayer = imread(fileName, as_grey=True, flatten=False)
+        H, W, L = Tlayer.shape
+
+    # Thermal image contains two layers - greyscale and alpha [0 255].  If alpha
+    # layer has value = 255, that corresponding pixel is transparent.  Create a 
+    # mask to exploit this and only extract temperature if mask[i,j] == 1
+    mask = Tlayer[:,:,1] == 255
+    
+    # Ordinarily we would use the vectors joining nodes on two of the sizes of 
+    # a pixel and take the cross product to define the area of the pixel.
+    # However, all pixels are the same size so we can get away with being lazy 
+    # here simplifying.  Is this truly in meters???
+    Origin = (0.0, 0.0)
+    Target = (transform[1]/1e5, 0.0)
+    northingPixelSize = distanceToTarget(Origin, Target)
+    Target = (0.0, -transform[5]/1e5)
+    eastingPixelSize  = distanceToTarget(Origin, Target)
+    pixelAreaInMeters = northingPixelSize * eastingPixelSize
+    # How many pixels actually correspond to thermally-active zones
+    areaCount = np.count_nonzero(mask)
+
+    # Define Stefan-Boltzmann constant and emissivities (8-14 micron band)
+    stefanBoltzmann  = 5.67e-8  # W m**-2 K**-4
+    epsilonSurface   = 0.975    # See table 2.3 of Harris (2013, pp. 81)
+    epsilonAtmosph   = atmosphericEmissivity(df)  # Fill in function
+    tauAtmosph       = 1.0 - epsilonAtmosph
+    # Heat transfer coefficient
+    hc = .4
+
+    # Initialise radiative, convective and total surface fluxes
+    Qrad     = np.zeros((H, W))  # 0.0
+    QradTot  = 0.0
+    Qconv    = np.zeros((H, W))
+    QconvTot = 0.0
+    Qsurf    = np.zeros((H, W))
+    QsurfTot = 0.0
+
+    # Define temperature range 
+    Trange = np.array([23., 80.]) + 273.14  # Kelvin
+
+    # Convert pixel values to real (absolute) temperatures
+    TempField  = Tlayer[:,:,0] / 255.0       # Normalise values 
+    TempField *= Trange.max() - Trange.min() # Scale by temperature range
+    TempField += Trange.min()                # Add offset
+
+    # Ambient temperature for measurements taken at SITE05
+    Tamb  = df[df.POS == 5].TEMP.values[0] + 273.14  # Kelvin
+    Tamb4 = Tamb ** 4  # To avoid excessive operations
+    epsTambPow4  = epsilonAtmosph * Tamb4    
+
+    for row in xrange(0, H):
+        for col in xrange(0, W):
+            # Coordinates of the current location
+            coors = pixel2coord(col, row, transform)
+
+            # Temperature at the current location
+            # T = val_raster(coors, Tlayer)
+            if mask[row, col]: 
+                T = TempField[row, col]
+                # Invert Planck function to find kinetic temperature, Tstar
+                Tstar = np.power((T**4 - epsilonAtmosph * Tamb4) 
+                                 / (epsilonSurface * tauAtmosph), .25)
+                Qrad[row, col]  = (epsilonSurface * pixelAreaInMeters 
+                                   * stefanBoltzmann * (Tstar**4 - Tamb4))
+                Qconv[row, col] = hc * pixelAreaInMeters * (Tstar - Tamb)
+                Qsurf[row, col] = Qrad[row, col] + Qconv[row, col]
+                QradTot  += Qrad[row, col]
+                QconvTot += Qconv[row, col]
+                QsurfTot += Qsurf[row, col]
+                # print coors, T, pixelAreaInMeters, Qrad
+
+    # Convert total fluxes to MW for easier typing later
+    QradTot  *= 1e-6
+    QconvTot *= 1e-6
+    QsurfTot *= 1e-6
+
+    # Total radiative flux, not accounting for atmospheric and ground 
+    # emissivities
+    print ''  # Clear line
+    print 'Total radiative  flux : %.2f MW' % (QradTot)
+    print 'Total convective flux : %.2f MW' % (QconvTot)
+    print 'Total surface flux    : %.2f MW' % (QsurfTot)
+    print 'Sanity check: \n%.2f = %.2f + %.2f = %.2f\n' % (QsurfTot, QradTot, 
+                                                           QconvTot, 
+                                                           QradTot + QconvTot)
+
+    # Plot and save flux maps
+    # yMax, xMin, foo, bar = utm.from_latlon(transform[0]/1e5, transform[4]/1e5)
+    # yMin, xMax, foo, bar = utm.from_latlon((transform[0]+H*transform[1])/1e5,
+    #                        (transform[3] + W*transform[5])/1e5)
+    # Radiative fluxes
+    Qrad[Qrad == 0.0] = None  # So that the "empty" pixels are "transparent"
+    plt.figure(figsize=(8,6), dpi=300)
+    plt.imshow(Qrad, cmap=cmaps.get('magma'), clim=(0.0, 50.0))    
+    # colourbar properties
+    cbar = plt.colorbar(shrink=.65)
+    cbar.set_label(label='Radiative heat flux/[W/pixel]', 
+                   rotation = 270, labelpad=15)
+    # labels + title
+    plt.xlabel('E-W distance/[pixels]')
+    plt.ylabel('N-S distance/[pixels]')
+    plt.title('Total radiative flux: %.2f MW' % (QradTot))
+    plt.draw()
+    plt.savefig('Qrad.pdf')
+    plt.close()
+
+
+    # Convective fluxes
+    Qconv[Qconv == 0.0] = None #
+    plt.figure(figsize=(8,6), dpi=300)
+    plt.imshow(Qconv, cmap=cmaps.get('magma'), clim=(0.0, 5.0))
+    # colourbar properties
+    cbar = plt.colorbar(shrink=.65)
+    cbar.set_label(label='Convective heat flux/[W/pixel]', 
+                   rotation = 270, labelpad=15)
+    # labels + title
+    plt.xlabel('E-W distance/[pixels]')
+    plt.ylabel('N-S distance/[pixels]')
+    plt.title('Total convective flux: %.2f MW' % (QconvTot))
+    plt.draw()
+    plt.savefig('Qconv.pdf')
+    plt.close()
+
+    # Total surface fluxes (= QradTot + QconvTot)
+    Qsurf[Qsurf == 0.0] = None #
+    plt.figure(figsize=(8,6), dpi=300)
+    plt.imshow(Qsurf, cmap=cmaps.get('magma'), clim=(0.0, 80.0))
+    # colourbar properties
+    cbar = plt.colorbar(shrink=.65)
+    cbar.set_label(label='Surface heat flux/[W/pixel]', 
+                   rotation = 270, labelpad=15)
+    # labels + title
+    plt.xlabel('E-W distance/[pixels]')
+    plt.ylabel('N-S distance/[pixels]')
+    plt.title('Total surface flux: %.2f MW' % (QsurfTot))
+    plt.draw()
+    plt.savefig('Qsurf.pdf')
+    plt.close()
+
+
+    # SAVE A COPY OF THE BASIC IMAGE
+    fileName = './SITE05/stitched/SITE05.tif'
+    im = imread(fileName, as_grey=True, flatten=False)
+    # Convert to grey scale as per MATLAB
+    imGrey = np.dot(im[...,:3], [.2989, .5870, .1140])
+    # Normalise to [0, 1]
+    imGrey /= 255.0
+    # Rescale to temperature range
+    imRescaled = imGrey * (Trange.max() - Trange.min()) + Trange.min()
+    # Set transparent pixels in original image to be beyond the T range
+    imRescaled[im[...,3] == 0.0] = 0.0  # Absolute zero!
+    
+    # Plot the image and save
+    plt.figure(figsize=(8,6), dpi=300)
+    plt.imshow(imRescaled, cmap=cmaps.get('inferno'), 
+               clim=[Trange.min(), 325]) #Trange.max()])
+
+    # Set up colorbar properties
+    # cbar tick marks
+    tickPosns = np.arange(300, 330, 5) 
+    # Define colorbar
+    cbar = plt.colorbar(shrink=.4, ticks=tickPosns)
+    # Set cbar label properties
+    cbar.set_label('Apparent temp./[K]', rotation=270, labelpad=15)
+    # Set cbar tick labels
+    tickPosnLabels = map(str, tickPosns)  # note the nice mapping
+    # tickPosnLabels[0] = '< ' + tickPosnLabels[0]
+    tickPosnLabels[-1] = '> ' + tickPosnLabels[-1]
+    cbar.ax.set_yticklabels(tickPosnLabels)
+
+    #plt.show()
+    plt.savefig('./SITE05/stitched/SITE05-cbar.pdf')
+    plt.close()
+
